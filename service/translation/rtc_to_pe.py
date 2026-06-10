@@ -136,29 +136,41 @@ def _emit_reserve_members(
             members[_SINGLE_BAND_NAMES[product]] = dict(bid_payload)
             continue
 
-        # Multi-band wire-shape compatibility: allocate the full bid to the
-        # cheapest offer band (band 1).  The v1 solver is deterministic and
-        # never benefits from spreading across bands, so this is exact.
-        # When a future iteration models price uncertainty, the spread
-        # logic moves here.
-        prices = offer_prices_per_product.get(product) or []
-        zeros = [0.0] * len(bid_payload["values"])
-        zero_payload: dict[str, Any] = {"values": zeros}
-        if grid is not None:
-            zero_payload["interval_start"] = list(grid["interval_start"])
-            zero_payload["interval_end"] = list(grid["interval_end"])
-        members[f"{product}_capacity_deltas[1]"] = dict(bid_payload)
-        for k in range(2, n_bands + 1):
-            members[f"{product}_capacity_deltas[{k}]"] = {
-                key: list(value) for key, value in zero_payload.items()
-            }
-        info.append(
-            f"approximation: multi-band bid for '{product}' "
-            f"(n_price_bands={n_bands}) collapsed to band 1 "
-            f"(cheapest offer price = "
-            f"{prices[0] if prices else 'unknown'}); v1 solver treats "
-            f"clearing as deterministic so spreading bands adds no value"
-        )
+        # Multi-band output: read actual per-band solver output from CSV
+        # when the columns exist. The v2 solver distributes MW across bands
+        # based on acceptance probabilities.
+        delta_base = f"{product}_capacity_deltas"
+        has_band_columns = f"{delta_base}[1]" in df.columns
+        if has_band_columns:
+            for k in range(1, n_bands + 1):
+                col = f"{delta_base}[{k}]"
+                if col in df.columns:
+                    band_values = _safe_list(df[col])
+                    members[f"{product}_capacity_deltas[{k}]"] = _shape_by_grid(
+                        band_values, grid
+                    )
+                else:
+                    zeros = [0.0] * len(bid_payload["values"])
+                    members[f"{product}_capacity_deltas[{k}]"] = _shape_by_grid(
+                        zeros, grid
+                    )
+        else:
+            # Fallback: allocate the full bid to band 1 (single-band solver)
+            members[f"{product}_capacity_deltas[1]"] = dict(bid_payload)
+            zeros = [0.0] * len(bid_payload["values"])
+            zero_payload: dict[str, Any] = {"values": zeros}
+            if grid is not None:
+                zero_payload["interval_start"] = list(grid["interval_start"])
+                zero_payload["interval_end"] = list(grid["interval_end"])
+            for k in range(2, n_bands + 1):
+                members[f"{product}_capacity_deltas[{k}]"] = {
+                    key: list(value) for key, value in zero_payload.items()
+                }
+            info.append(
+                f"approximation: multi-band bid for '{product}' "
+                f"(n_price_bands={n_bands}) collapsed to band 1 — "
+                f"per-band columns not in solver output"
+            )
 
 
 # ── aFRR energy bid pricing (post-solve) ────────────────────────────
@@ -361,20 +373,30 @@ def translate_scheduling_result(
         grids,
     )
 
-    # Document outputs the PE API returns but we don't
-    # Multi-band deltas — only relevant if the request had multi-band pricing
+    # Per-band DA deltas — emit when the solver produced multi-band output
     for market in model_input.get("markets", []):
-        if market.get("type") == "bid_offer_stack":
-            n_bands = market.get("n_price_bands", 1)
+        if market.get("type") == "bid_offer_stack" and market.get("name") == "day_ahead":
+            n_bands = int(market.get("n_price_bands", 1) or 1)
             if n_bands > 1:
-                info.append(
-                    f"not_in_output: 'day_ahead_power_out_deltas[1..{n_bands}]' "
-                    f"— multi-band pricing not supported"
-                )
-                info.append(
-                    f"not_in_output: 'day_ahead_power_in_deltas[1..{n_bands}]' "
-                    f"— multi-band pricing not supported"
-                )
+                for k in range(1, n_bands + 1):
+                    col_in = f"da_power_in_deltas[{k}]"
+                    col_out = f"da_power_out_deltas[{k}]"
+                    if col_in in df.columns:
+                        members[f"day_ahead_power_in_deltas[{k}]"] = _shape_by_grid(
+                            _safe_list(df[col_in]), da_grid
+                        )
+                    else:
+                        members[f"day_ahead_power_in_deltas[{k}]"] = _shape_by_grid(
+                            [0.0] * n, da_grid
+                        )
+                    if col_out in df.columns:
+                        members[f"day_ahead_power_out_deltas[{k}]"] = _shape_by_grid(
+                            _safe_list(df[col_out]), da_grid
+                        )
+                    else:
+                        members[f"day_ahead_power_out_deltas[{k}]"] = _shape_by_grid(
+                            [0.0] * n, da_grid
+                        )
 
     reasoning_markdown = ""
     if prob is not None:

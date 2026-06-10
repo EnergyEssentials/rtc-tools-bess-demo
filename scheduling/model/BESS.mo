@@ -5,15 +5,23 @@ model BESS
   parameter Real max_power = 50.0 "Maximum charge/discharge power in MW";
 
   // Bid-curve dimensions (patched per request by the service layer; default 1 = single-band)
+  parameter Integer n_da_bands = 1 "Number of day-ahead bid/offer price bands";
   parameter Integer n_fcr_bands = 1 "Number of FCR offer-price bands";
   parameter Integer n_afrr_up_bands = 1 "Number of aFRR up offer-price bands";
   parameter Integer n_afrr_down_bands = 1 "Number of aFRR down offer-price bands";
 
   // Physical battery state and dispatch
   output Real soc(start=50.0, min=0.0, max=capacity) "State of charge in MWh";
-  output Real charge_power(min=0.0, max=max_power) "Charging power in MW";
-  output Real discharge_power(min=0.0, max=max_power) "Discharging power in MW";
+  output Real charge_power(min=0.0, max=max_power) "Charging power in MW (derived from DA band sum)";
+  output Real discharge_power(min=0.0, max=max_power) "Discharging power in MW (derived from DA band sum)";
   output Real net_power "Net power (positive = discharge, negative = charge) in MW";
+
+  // Day-ahead per-band decision variables (incremental MW at each ascending price level).
+  // charge_power and discharge_power are derived as sums of these arrays.
+  input Real da_power_in_deltas[n_da_bands](each fixed = false, each min = 0.0)
+    "DA buy bid stack — MW added at each ascending price level";
+  input Real da_power_out_deltas[n_da_bands](each fixed = false, each min = 0.0)
+    "DA sell offer stack — MW added at each ascending price level";
 
   // Aggregated reserve quantities — exposed as outputs so the result CSV
   // carries them directly for diagnostics and downstream consumers.
@@ -60,6 +68,10 @@ model BESS
     "aFRR down bid stack — MW added at each ascending offer price";
 
 equation
+  // Physical dispatch = sum across all DA price bands
+  charge_power = sum(da_power_in_deltas);
+  discharge_power = sum(da_power_out_deltas);
+
   // Total bid per product = sum across price-bands
   bid_fcr_total       = sum(fcr_capacity_deltas);
   bid_afrr_up_total   = sum(afrr_up_capacity_deltas);

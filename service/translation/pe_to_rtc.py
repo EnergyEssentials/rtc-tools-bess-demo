@@ -12,6 +12,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from service.translation.clearing_probability import (
+    compute_acceptance_probabilities,
+    compute_clearing_probabilities,
+)
+
 
 @dataclass
 class TranslationResult:
@@ -52,6 +57,14 @@ class TranslationResult:
     afrr_energy_n_bands: int = 0
     afrr_energy_markup: float = 0.0
     afrr_energy_grid: dict | None = None
+    # Multi-band DA config — consumed by solver_runner to inject probabilities
+    # into the dynamic solver class and select the correct model directory.
+    n_da_bands: int = 1
+    da_band_prices: list[float] = field(default_factory=list)
+    # Per-PTU clearing probabilities [n_ptu][n_bands] for DA expected-value objective.
+    da_clearing_probs: list[list[float]] = field(default_factory=list)
+    # Per-product acceptance probabilities [n_ptu][n_bands] for pay-as-bid reserve markets.
+    reserve_acceptance_probs: dict[str, list[list[float]]] = field(default_factory=dict)
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -116,6 +129,26 @@ def _write_csv(header: list[str], rows: list[list[Any]]) -> str:
     writer.writerow(header)
     writer.writerows(rows)
     return buf.getvalue()
+
+
+def _parse_ensemble(
+    model_input: dict[str, Any], base_name: str
+) -> list[list[float]] | None:
+    """Extract ensemble member timeseries matching ``base_name[1]``, ``[2]``, etc.
+
+    Returns a list of M series (each of length T), or None if no members found.
+    """
+    members: list[list[float]] = []
+    m = 1
+    while True:
+        ts = _find_timeseries(model_input, f"{base_name}[{m}]")
+        if ts is None:
+            break
+        values = ts.get("values")
+        if values:
+            members.append([float(v) for v in values])
+        m += 1
+    return members if members else None
 
 
 # ── reserve markets (FCR / aFRR) ─────────────────────────────────────
@@ -688,33 +721,52 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
             "— local solver uses HiGHS default tolerances"
         )
 
-    # ignored market configs
+    # ── day-ahead market config (multi-band) ──
+    n_da_bands = 1
+    da_band_prices: list[float] = []
+    da_clearing_probs: list[list[float]] = []
+    reserve_acceptance_probs: dict[str, list[list[float]]] = {}
+    confidence_pct = 10.0
+
     for market in model_input.get("markets", []):
         mname = market.get("name", "unknown")
         mtype = market.get("type", "unknown")
         if mname in _RESERVE_PRODUCTS:
-            # Reserve markets handled by _extract_reserves below
             continue
         if mtype == "imbalance":
             info.append(
                 f"ignored_input: market config '{mname}' (type={mtype}) "
                 f"— imbalance market not modeled"
             )
+        elif mtype == "bid_offer_stack" and mname == "day_ahead":
+            n_da_bands = int(market.get("n_price_bands", 1) or 1)
+            da_band_prices = [float(p) for p in (market.get("bid_offer_prices") or [])]
+            confidence_pct = float(market.get("confidence_pct", 10.0))
+            if n_da_bands > 1 and da_band_prices:
+                # Parse ensemble timeseries if available
+                ensemble_members = _parse_ensemble(model_input, "day_ahead_price_ensemble")
+                da_clearing_probs = compute_clearing_probabilities(
+                    band_prices=da_band_prices,
+                    point_forecast=prices,
+                    ensemble_members=ensemble_members or None,
+                    confidence_pct=confidence_pct,
+                )
+                source = "ensemble" if ensemble_members else "normal_fallback"
+                info.append(
+                    f"applied: multi-band DA bid (n_price_bands={n_da_bands}, "
+                    f"source={source})"
+                )
+            elif n_da_bands > 1:
+                info.append(
+                    f"approximation: market 'day_ahead' has n_price_bands={n_da_bands} "
+                    f"but no bid_offer_prices — falling back to single-band"
+                )
+                n_da_bands = 1
         elif mtype == "bid_offer_stack":
-            n_bands = market.get("n_price_bands", 1)
-            if n_bands > 1:
-                info.append(
-                    f"ignored_input: market config '{mname}' "
-                    f"(n_price_bands={n_bands}) — single-band only"
-                )
-            ignored_keys = [
-                k for k in ("min_price", "max_price", "bid_offer_prices") if k in market
-            ]
-            if ignored_keys:
-                info.append(
-                    f"ignored_input: market config '{mname}' "
-                    f"keys {ignored_keys} — not used by local solver"
-                )
+            info.append(
+                f"ignored_input: market config '{mname}' (type={mtype}) "
+                f"— only 'day_ahead' bid_offer_stack is supported"
+            )
 
     # ── reserves ──
     (
@@ -726,6 +778,36 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
     ) = _extract_reserves(model_input, ptu_starts_dt, info)
     market_grids.update(reserve_market_grids)
     n_intervals = len(interval_start)
+
+    # Compute acceptance probabilities for open reserve markets (pay-as-bid)
+    for product in _RESERVE_PRODUCTS:
+        pcfg = reserve_config.get(product) or {}
+        if not pcfg.get("open"):
+            continue
+        offer_prices = offer_prices_per_product.get(product, [])
+        n_product_bands = n_bands_per_product.get(product, 1)
+        if n_product_bands > 1 and offer_prices:
+            standby_name = f"{product}_standby_price"
+            standby_ts = _find_timeseries(model_input, standby_name)
+            standby_values, _ = _expand_timeseries_to_ptu(
+                standby_ts, ptu_starts_dt, standby_name
+            )
+            forecast = standby_values or [0.0] * n_intervals
+            ensemble_members = _parse_ensemble(
+                model_input, f"{product}_standby_price_ensemble"
+            )
+            probs = compute_acceptance_probabilities(
+                offer_prices=offer_prices,
+                clearing_price_forecast=forecast,
+                ensemble_members=ensemble_members,
+                confidence_pct=confidence_pct,
+            )
+            reserve_acceptance_probs[product] = probs
+            source = "ensemble" if ensemble_members else "normal_fallback"
+            info.append(
+                f"applied: pay-as-bid acceptance probabilities for '{product}' "
+                f"(n_bands={n_product_bands}, source={source})"
+            )
 
     # ── build CSVs ──
 
@@ -846,6 +928,10 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
         offer_prices_per_product=offer_prices_per_product,
         skip_counterfactual_reserves=skip_counterfactual,
         market_grids=market_grids,
+        n_da_bands=n_da_bands,
+        da_band_prices=da_band_prices,
+        da_clearing_probs=da_clearing_probs,
+        reserve_acceptance_probs=reserve_acceptance_probs,
     )
 
 

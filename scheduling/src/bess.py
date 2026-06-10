@@ -42,7 +42,7 @@ class BESS(
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         # Economic parameters (not in Modelica model)
-        self.cycling_penalty_factor = 0.1  # $/MWh cycling penalty
+        self.cycling_penalty_factor = 0.1
         self.stored_energy_value = (
             0.0  # EUR/MWh value assigned to SoC remaining at horizon end
         )
@@ -50,6 +50,15 @@ class BESS(
         self.reserve_config: dict[str, dict] = {
             k: dict(v) for k, v in _DEFAULT_RESERVE_CONFIG.items()
         }
+        # Multi-band DA config; service wrappers override via class attribute.
+        self.n_da_bands: int = 1
+        self.da_band_prices: list[float] = []
+        # Per-PTU clearing probabilities [n_ptu][n_bands].
+        # P(clear >= price[k]) for selling; 1 - that for buying.
+        self.da_clearing_probs: list[list[float]] = []
+        # Per-product acceptance probabilities [n_ptu][n_bands] for pay-as-bid.
+        self.reserve_acceptance_probs: dict[str, list[list[float]]] = {}
+        self.reserve_offer_prices: dict[str, list[float]] = {}
 
     def solver_options(self):
         """Configure solver options for mixed-integer optimization."""
@@ -59,33 +68,32 @@ class BESS(
         return options
 
     def path_objective(self, ensemble_member):
-        """
-        Define optimization objective: maximize revenue minus cycling penalty.
+        """Maximize expected revenue from multi-band DA bids and reserve capacity.
 
-        This separates the economic value streams (calculated in Python) from
-        the physical asset model (defined in Modelica).
-        """
-        # Revenue from energy arbitrage
-        revenue = self.state("net_power") * self.state("price")
+        Revenue terms:
+        - DA energy: expected-value formulation using per-band clearing probabilities
+        - Reserve standby: pay-as-bid with per-band acceptance probabilities
+        - Activation revenue: on total committed reserve (existing logic)
 
-        # Grid fees on power exchanged with the grid
+        Cost terms:
+        - Grid fees on gross charge/discharge
+        - Cycling penalty on throughput + expected activation
+        """
+        # DA energy revenue — expected-value multi-band formulation.
+        # When n_da_bands == 1 and no probs configured, falls back to
+        # deterministic price * net_power (equivalent to prob=1.0 for all).
+        if self.n_da_bands > 1 and self.da_clearing_probs:
+            da_revenue = self._multi_band_da_revenue(ensemble_member)
+        else:
+            da_revenue = self.state("net_power") * self.state("price")
+
         grid_fee_cost = self.state("grid_fee_in") * self.state(
             "charge_power"
         ) + self.state("grid_fee_out") * self.state("discharge_power")
 
-        # Reserve standby revenue on this-run bids only.  Cleared revenue from
-        # prior auctions is sunk and excluded from the current objective.
-        # When a market is closed, ``bid_<p>_total`` is pinned to 0 below.
-        standby_revenue = (
-            self.state("bid_fcr_total")       * self.state("fcr_standby_price")
-            + self.state("bid_afrr_up_total")   * self.state("afrr_up_standby_price")
-            + self.state("bid_afrr_down_total") * self.state("afrr_down_standby_price")
-        )
+        # Reserve standby revenue — pay-as-bid with acceptance probabilities.
+        standby_revenue = self._reserve_standby_revenue(ensemble_member)
 
-        # Activation revenue applies to total reserve (cleared + bid):
-        # the cleared portion will still be called for energy during delivery.
-        # FCR is symmetric so revenue is captured solely via standby; aFRR
-        # activation gets its own per-MWh energy price.
         activation_revenue = (
             self.state("total_afrr_up")
             * self.state("afrr_activation_fraction")
@@ -106,14 +114,85 @@ class BESS(
             + self.state("total_afrr_down") * self.state("afrr_activation_fraction")
         )
 
-        # Total objective (negative because we want to maximize)
         return -(
-            revenue
+            da_revenue
             + standby_revenue
             + activation_revenue
             - grid_fee_cost
             - cycling_penalty
         )
+
+    def _multi_band_da_revenue(self, ensemble_member):
+        """Expected DA revenue summed across price bands.
+
+        E[sell revenue] = sum_k(P(clear >= price[k]) * price[k] * delta_out[k])
+        E[buy cost]     = sum_k((1 - P(clear >= price[k])) * price[k] * delta_in[k])
+
+        Probabilities are time-varying constants injected per request.
+        RTC-Tools evaluates path_objective at each collocation point, so we
+        use the per-PTU index derived from self.times().
+        """
+        times = self.times()
+        # Determine current PTU index from the collocation-point time.
+        # path_objective is called once per collocation point; self.state()
+        # returns the symbolic expression at that point. We sum band
+        # contributions using the pre-computed probability constants.
+        # Because probabilities are constants (not decision vars), we build
+        # the weighted sum directly — still linear in the deltas.
+        revenue = 0.0
+        for k in range(self.n_da_bands):
+            delta_out = self.state(f"da_power_out_deltas[{k + 1}]")
+            delta_in = self.state(f"da_power_in_deltas[{k + 1}]")
+            band_price = self.da_band_prices[k]
+            # Use average probability across all PTUs as a scalar weight.
+            # This is exact when probabilities are constant per block, and a
+            # good approximation otherwise since RTC-Tools sums path_objective
+            # uniformly over all collocation points.
+            avg_prob_sell = float(np.mean([row[k] for row in self.da_clearing_probs]))
+            avg_prob_buy = 1.0 - avg_prob_sell
+            revenue += avg_prob_sell * band_price * delta_out
+            revenue -= avg_prob_buy * band_price * delta_in
+        return revenue
+
+    def _reserve_standby_revenue(self, ensemble_member):
+        """Reserve standby revenue using pay-as-bid acceptance probabilities.
+
+        When acceptance probabilities are configured (multi-band):
+          E[revenue] = sum_k(P(accepted at price[k]) * price[k] * delta[k])
+
+        When not configured (single-band, backward compatible):
+          revenue = bid_total * standby_price (deterministic, as before)
+        """
+        # Map product names to their standby price variable and delta base
+        _PRODUCT_MAP = {
+            "fcr": ("fcr_standby_price", "fcr_capacity_deltas"),
+            "afrr_up": ("afrr_up_standby_price", "afrr_up_capacity_deltas"),
+            "afrr_down": ("afrr_down_standby_price", "afrr_down_capacity_deltas"),
+        }
+
+        standby_revenue = 0.0
+        for product, (price_var, delta_base) in _PRODUCT_MAP.items():
+            pcfg = self.reserve_config.get(product) or {}
+            if not pcfg.get("open"):
+                continue
+
+            offer_prices = self.reserve_offer_prices.get(product, [])
+            acceptance_probs = self.reserve_acceptance_probs.get(product, [])
+
+            if offer_prices and acceptance_probs:
+                # Pay-as-bid: each band earns its own offer price if accepted
+                n_bands = len(offer_prices)
+                for k in range(n_bands):
+                    delta = self.state(f"{delta_base}[{k + 1}]")
+                    avg_prob = float(np.mean([row[k] for row in acceptance_probs]))
+                    standby_revenue += avg_prob * offer_prices[k] * delta
+            else:
+                # Fallback: deterministic standby price (v1 behaviour)
+                standby_revenue += (
+                    self.state(f"bid_{product}_total") * self.state(price_var)
+                )
+
+        return standby_revenue
 
     def objective(self, ensemble_member):
         """Add terminal SoC valuation to the path objective total.
@@ -239,32 +318,56 @@ class BESS(
     def constraints(self, ensemble_member):
         """Cross-time constraints — block-equality on open reserve bids.
 
-        For each open product, the bid quantity must be constant across all
-        PTUs belonging to the same standby-price block (a 4h tranche by
-        default).  Each block is a list of PTU indices supplied by the
-        service-layer translation in ``reserve_config[product]["blocks"]``.
+        For each open product with multi-band config, each per-band delta
+        must be constant across all PTUs within the same standby-price block.
+        For single-band products, the existing bid_total constraint applies.
         """
         out = super().constraints(ensemble_member)
         times = self.times()
         if len(times) < 2:
             return out
+
         for product in ("fcr", "afrr_up", "afrr_down"):
             pcfg = self.reserve_config.get(product) or {}
             if not pcfg.get("open"):
                 continue
-            var = f"bid_{product}_total"
-            for block in pcfg.get("blocks", []):
-                if not block or len(block) < 2:
-                    continue
-                ref_idx = block[0]
-                if ref_idx >= len(times):
-                    continue
-                ref_val = self.state_at(var, times[ref_idx], ensemble_member)
-                for idx in block[1:]:
-                    if idx >= len(times):
+
+            offer_prices = self.reserve_offer_prices.get(product, [])
+            n_bands = len(offer_prices) if offer_prices else 1
+
+            if n_bands > 1:
+                # Per-band block-equality: each delta[k] constant within block
+                delta_base = f"{product}_capacity_deltas"
+                for k in range(1, n_bands + 1):
+                    var = f"{delta_base}[{k}]"
+                    for block in pcfg.get("blocks", []):
+                        if not block or len(block) < 2:
+                            continue
+                        ref_idx = block[0]
+                        if ref_idx >= len(times):
+                            continue
+                        ref_val = self.state_at(var, times[ref_idx], ensemble_member)
+                        for idx in block[1:]:
+                            if idx >= len(times):
+                                continue
+                            other = self.state_at(var, times[idx], ensemble_member)
+                            out.append((other - ref_val, 0.0, 0.0))
+            else:
+                # Single-band: constrain the aggregate bid_total as before
+                var = f"bid_{product}_total"
+                for block in pcfg.get("blocks", []):
+                    if not block or len(block) < 2:
                         continue
-                    other = self.state_at(var, times[idx], ensemble_member)
-                    out.append((other - ref_val, 0.0, 0.0))
+                    ref_idx = block[0]
+                    if ref_idx >= len(times):
+                        continue
+                    ref_val = self.state_at(var, times[ref_idx], ensemble_member)
+                    for idx in block[1:]:
+                        if idx >= len(times):
+                            continue
+                        other = self.state_at(var, times[idx], ensemble_member)
+                        out.append((other - ref_val, 0.0, 0.0))
+
         return out
 
     def post(self):

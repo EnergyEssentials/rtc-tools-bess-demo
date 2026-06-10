@@ -77,6 +77,12 @@ _INTRADAY_MO = _INTRADAY_MODEL / "BESSIntraday.mo"
 _intraday_model_cache: dict[int, Path] = {}
 _intraday_model_lock = threading.Lock()
 
+# Scheduling model directory cache keyed by n_da_bands.  When n_da_bands == 1
+# the original repo directory is used.  For n_da_bands > 1, a patched copy
+# of BESS.mo is written to a stable temp directory (same pattern as intraday).
+_scheduling_model_cache: dict[int, Path] = {}
+_scheduling_model_lock = threading.Lock()
+
 
 def run_solver(
     solver_type: str,
@@ -128,24 +134,31 @@ def _run_scheduling(
                 "_cycling_penalty": translation.cycling_penalty,
                 "_stored_energy_value": translation.stored_energy_value,
                 "_reserve_config": translation.reserve_config,
+                "_n_da_bands": translation.n_da_bands,
+                "_da_band_prices": translation.da_band_prices,
+                "_da_clearing_probs": translation.da_clearing_probs,
+                "_reserve_acceptance_probs": translation.reserve_acceptance_probs,
+                "_reserve_offer_prices": translation.offer_prices_per_product,
                 "model_name": "BESS",
             },
         )
 
         _log.info(
             "Running scheduling solver (cycling_penalty=%.4f, "
-            "stored_energy_value=%.4f)",
+            "stored_energy_value=%.4f, n_da_bands=%d)",
             translation.cycling_penalty,
             translation.stored_energy_value,
+            translation.n_da_bands,
         )
         # model_folder points at the stable repo directory so pymoca's
         # .pymoca_cache is preserved across requests.  input/output remain
         # in the per-run temp directory.
         # The returned problem instance exposes solver internals (objective
         # value, solver stats, Lagrange multipliers) used for diagnostics.
+        model_dir = _get_scheduling_model_dir(translation.n_da_bands)
         prob = run_optimization_problem(
             klass,
-            model_folder=str(_SCHEDULING_MODEL),
+            model_folder=str(model_dir),
             input_folder=str(base / "input"),
             output_folder=str(base / "output"),
             log_level=logging.WARNING,
@@ -321,6 +334,48 @@ def _write_inputs(base: Path, translation: TranslationResult) -> None:
         (base / "input" / "parameters.csv").write_text(
             translation.parameters_csv, encoding="utf-8"
         )
+
+
+def _get_scheduling_model_dir(n_da_bands: int) -> Path:
+    """Return a stable model directory for *n_da_bands*, creating it on first use.
+
+    When n_da_bands == 1, the original repo directory is used unchanged
+    (no patching needed — the default in BESS.mo is already 1).
+    For n_da_bands > 1, a patched copy is written to a stable temp directory.
+    """
+    if n_da_bands <= 1:
+        return _SCHEDULING_MODEL
+
+    if n_da_bands in _scheduling_model_cache:
+        return _scheduling_model_cache[n_da_bands]
+
+    with _scheduling_model_lock:
+        if n_da_bands in _scheduling_model_cache:
+            return _scheduling_model_cache[n_da_bands]
+
+        model_dir = Path(tempfile.mkdtemp(prefix=f"bess_sched_model_{n_da_bands}_"))
+        _write_scheduling_model(model_dir, n_da_bands)
+        _scheduling_model_cache[n_da_bands] = model_dir
+        _log.info(
+            "Scheduling model directory created for n_da_bands=%d at %s",
+            n_da_bands,
+            model_dir,
+        )
+        return model_dir
+
+
+def _write_scheduling_model(model_dir: Path, n_da_bands: int) -> None:
+    """Write ``BESS.mo`` with ``n_da_bands`` set to the request value."""
+    mo_path = _SCHEDULING_MODEL / "BESS.mo"
+    mo_content = mo_path.read_text(encoding="utf-8")
+
+    mo_content = re.sub(
+        r"parameter\s+Integer\s+n_da_bands\s*=\s*\d+",
+        f"parameter Integer n_da_bands = {n_da_bands}",
+        mo_content,
+    )
+
+    (model_dir / "BESS.mo").write_text(mo_content, encoding="utf-8")
 
 
 def _get_intraday_model_dir(n_segments: int) -> Path:
