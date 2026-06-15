@@ -65,6 +65,14 @@ class BESS(
         options = super().solver_options()
         options["casadi_solver"] = "qpsol"
         options["solver"] = "highs"
+        # Bound MILP runtime: the multi-band formulation is degenerate by
+        # construction (zero-revenue / zero-probability bands), so HiGHS'
+        # default 1e-4 gap is unreachable.  1% gap is well below the
+        # ~5 EUR/MWh cycling penalty noise floor.
+        options["highs"] = {
+            "mip_rel_gap": 0.01,
+            "time_limit": 60.0,
+        }
         return options
 
     def path_objective(self, ensemble_member):
@@ -312,6 +320,48 @@ class BESS(
                 constraints.append(
                     (self.state(f"bid_{product}_total"), -np.inf, 0.0)
                 )
+
+        # Degenerate-band pin: bands whose effective objective coefficient
+        # is numerically zero (price == 0 or probability underflowed to 0)
+        # are free variables that the MILP B&B tree cannot distinguish,
+        # blocking convergence.  Pin them to 0 here; HiGHS presolve removes
+        # them entirely.
+        _ZERO_COEF_THRESHOLD = 1e-6
+
+        if self.n_da_bands > 1 and self.da_clearing_probs and self.da_band_prices:
+            for k, band_price in enumerate(self.da_band_prices):
+                avg_prob_sell = float(
+                    np.mean([row[k] for row in self.da_clearing_probs])
+                )
+                avg_prob_buy = 1.0 - avg_prob_sell
+                if abs(avg_prob_sell * band_price) < _ZERO_COEF_THRESHOLD:
+                    constraints.append(
+                        (self.state(f"da_power_out_deltas[{k + 1}]"), 0.0, 0.0)
+                    )
+                if abs(avg_prob_buy * band_price) < _ZERO_COEF_THRESHOLD:
+                    constraints.append(
+                        (self.state(f"da_power_in_deltas[{k + 1}]"), 0.0, 0.0)
+                    )
+
+        _RESERVE_DELTA_BASE = {
+            "fcr": "fcr_capacity_deltas",
+            "afrr_up": "afrr_up_capacity_deltas",
+            "afrr_down": "afrr_down_capacity_deltas",
+        }
+        for product, delta_base in _RESERVE_DELTA_BASE.items():
+            pcfg = self.reserve_config.get(product) or {}
+            if not pcfg.get("open"):
+                continue
+            offer_prices = self.reserve_offer_prices.get(product, [])
+            acceptance_probs = self.reserve_acceptance_probs.get(product, [])
+            if not offer_prices or not acceptance_probs:
+                continue
+            for k, offer_price in enumerate(offer_prices):
+                avg_prob = float(np.mean([row[k] for row in acceptance_probs]))
+                if abs(avg_prob * offer_price) < _ZERO_COEF_THRESHOLD:
+                    constraints.append(
+                        (self.state(f"{delta_base}[{k + 1}]"), 0.0, 0.0)
+                    )
 
         return constraints
 

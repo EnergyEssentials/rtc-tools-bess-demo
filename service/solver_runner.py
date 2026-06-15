@@ -77,10 +77,11 @@ _INTRADAY_MO = _INTRADAY_MODEL / "BESSIntraday.mo"
 _intraday_model_cache: dict[int, Path] = {}
 _intraday_model_lock = threading.Lock()
 
-# Scheduling model directory cache keyed by n_da_bands.  When n_da_bands == 1
-# the original repo directory is used.  For n_da_bands > 1, a patched copy
-# of BESS.mo is written to a stable temp directory (same pattern as intraday).
-_scheduling_model_cache: dict[int, Path] = {}
+# Scheduling model directory cache keyed by band dimensions tuple
+# (n_da_bands, n_fcr_bands, n_afrr_up_bands, n_afrr_down_bands).
+# When all are 1 the original repo directory is used.  For any > 1,
+# a patched copy of BESS.mo is written to a stable temp directory.
+_scheduling_model_cache: dict[tuple[int, int, int, int], Path] = {}
 _scheduling_model_lock = threading.Lock()
 
 
@@ -155,7 +156,13 @@ def _run_scheduling(
         # in the per-run temp directory.
         # The returned problem instance exposes solver internals (objective
         # value, solver stats, Lagrange multipliers) used for diagnostics.
-        model_dir = _get_scheduling_model_dir(translation.n_da_bands)
+        band_dims = (
+            translation.n_da_bands,
+            translation.n_bands_per_product.get("fcr", 1),
+            translation.n_bands_per_product.get("afrr_up", 1),
+            translation.n_bands_per_product.get("afrr_down", 1),
+        )
+        model_dir = _get_scheduling_model_dir(band_dims)
         prob = run_optimization_problem(
             klass,
             model_folder=str(model_dir),
@@ -336,44 +343,51 @@ def _write_inputs(base: Path, translation: TranslationResult) -> None:
         )
 
 
-def _get_scheduling_model_dir(n_da_bands: int) -> Path:
-    """Return a stable model directory for *n_da_bands*, creating it on first use.
+def _get_scheduling_model_dir(band_dims: tuple[int, int, int, int]) -> Path:
+    """Return a stable model directory for the given band dimensions.
 
-    When n_da_bands == 1, the original repo directory is used unchanged
-    (no patching needed — the default in BESS.mo is already 1).
-    For n_da_bands > 1, a patched copy is written to a stable temp directory.
+    Args:
+        band_dims: (n_da_bands, n_fcr_bands, n_afrr_up_bands, n_afrr_down_bands)
+
+    When all dimensions are 1, the original repo directory is used unchanged.
+    For any dimension > 1, a patched copy is written to a stable temp directory.
     """
-    if n_da_bands <= 1:
+    if band_dims == (1, 1, 1, 1):
         return _SCHEDULING_MODEL
 
-    if n_da_bands in _scheduling_model_cache:
-        return _scheduling_model_cache[n_da_bands]
+    if band_dims in _scheduling_model_cache:
+        return _scheduling_model_cache[band_dims]
 
     with _scheduling_model_lock:
-        if n_da_bands in _scheduling_model_cache:
-            return _scheduling_model_cache[n_da_bands]
+        if band_dims in _scheduling_model_cache:
+            return _scheduling_model_cache[band_dims]
 
-        model_dir = Path(tempfile.mkdtemp(prefix=f"bess_sched_model_{n_da_bands}_"))
-        _write_scheduling_model(model_dir, n_da_bands)
-        _scheduling_model_cache[n_da_bands] = model_dir
+        model_dir = Path(tempfile.mkdtemp(
+            prefix=f"bess_sched_model_{'_'.join(str(d) for d in band_dims)}_"
+        ))
+        _write_scheduling_model(model_dir, band_dims)
+        _scheduling_model_cache[band_dims] = model_dir
         _log.info(
-            "Scheduling model directory created for n_da_bands=%d at %s",
-            n_da_bands,
+            "Scheduling model directory created for band_dims=%s at %s",
+            band_dims,
             model_dir,
         )
         return model_dir
 
 
-def _write_scheduling_model(model_dir: Path, n_da_bands: int) -> None:
-    """Write ``BESS.mo`` with ``n_da_bands`` set to the request value."""
-    mo_path = _SCHEDULING_MODEL / "BESS.mo"
-    mo_content = mo_path.read_text(encoding="utf-8")
+def _write_scheduling_model(
+    model_dir: Path, band_dims: tuple[int, int, int, int]
+) -> None:
+    """Write ``BESS.mo`` with all band dimension parameters patched."""
+    mo_content = (_SCHEDULING_MODEL / "BESS.mo").read_text(encoding="utf-8")
 
-    mo_content = re.sub(
-        r"parameter\s+Integer\s+n_da_bands\s*=\s*\d+",
-        f"parameter Integer n_da_bands = {n_da_bands}",
-        mo_content,
-    )
+    param_names = ("n_da_bands", "n_fcr_bands", "n_afrr_up_bands", "n_afrr_down_bands")
+    for param, value in zip(param_names, band_dims):
+        mo_content = re.sub(
+            rf"parameter\s+Integer\s+{param}\s*=\s*\d+",
+            f"parameter Integer {param} = {value}",
+            mo_content,
+        )
 
     (model_dir / "BESS.mo").write_text(mo_content, encoding="utf-8")
 
