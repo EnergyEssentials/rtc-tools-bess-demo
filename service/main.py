@@ -11,7 +11,7 @@ from service.otel_setup import setup_otel
 from service.routes import router
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
 )
 
@@ -46,6 +46,11 @@ setup_otel(app)
 
 @app.get("/health")
 def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/healthz")
+def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
