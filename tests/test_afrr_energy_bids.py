@@ -1,17 +1,14 @@
-"""Tests for aFRR energy bid pricing (post-solve marginal cost computation)."""
+"""Tests for aFRR energy bid pricing (IC orderbook mid-price)."""
 
 from __future__ import annotations
 
 import copy
-import math
 from typing import Any
 
-import numpy as np
 import pandas as pd
 import pytest
 
 from service.translation.pe_to_rtc import (
-    TranslationResult,
     _extract_afrr_energy_market,
     _parse_iso_utc,
     translate_intraday,
@@ -23,15 +20,14 @@ from service.translation.rtc_to_pe import _compute_afrr_energy_bids
 
 
 class TestExtractAfrrEnergyMarket:
-    """Input parsing for aFRR energy bid market."""
+    """Input parsing for the aFRR energy bid market."""
 
     def test_no_market_returns_defaults(self) -> None:
-        """No afrr_energy market entry → all zeros, no open PTUs."""
         model_input: dict[str, Any] = {"markets": [], "timeseries": [], "parameters": []}
         ptu_starts = [_parse_iso_utc(f"2025-08-01T{h:02d}:00:00Z") for h in range(4)]
         info: list[str] = []
 
-        up, down, mask, n_bands, markup, grid = _extract_afrr_energy_market(
+        up, down, mask, n_bands, grid = _extract_afrr_energy_market(
             model_input, ptu_starts, info
         )
 
@@ -39,16 +35,11 @@ class TestExtractAfrrEnergyMarket:
         assert down == [0.0] * 4
         assert mask == [False] * 4
         assert n_bands == 0
-        assert markup == 0.0
         assert grid is None
         assert info == []
 
     def test_market_with_obligations_populates_fields(self) -> None:
-        """afrr_energy market with obligation timeseries → correct extraction."""
-        ptu_starts_iso = [f"2025-08-01T{h:02d}:00:00Z" for h in range(4)]
-        ptu_starts = [_parse_iso_utc(t) for t in ptu_starts_iso]
-
-        # Obligations on PTUs 1 and 2 only (their own grid)
+        ptu_starts = [_parse_iso_utc(f"2025-08-01T{h:02d}:00:00Z") for h in range(4)]
         model_input: dict[str, Any] = {
             "markets": [
                 {"name": "afrr_energy", "type": "afrr_energy_bid", "n_price_bands": 2}
@@ -67,13 +58,11 @@ class TestExtractAfrrEnergyMarket:
                     "interval_end": ["2025-08-01T02:00:00Z", "2025-08-01T03:00:00Z"],
                 },
             ],
-            "parameters": [
-                {"name": "afrr_energy_markup", "value": 3.0},
-            ],
+            "parameters": [],
         }
         info: list[str] = []
 
-        up, down, mask, n_bands, markup, grid = _extract_afrr_energy_market(
+        up, down, mask, n_bands, grid = _extract_afrr_energy_market(
             model_input, ptu_starts, info
         )
 
@@ -81,14 +70,12 @@ class TestExtractAfrrEnergyMarket:
         assert down == [0.0, 5.0, 5.0, 0.0]
         assert mask == [False, True, True, False]
         assert n_bands == 2
-        assert markup == 3.0
         assert grid is not None
         assert len(grid["interval_start"]) == 2
 
     def test_translate_intraday_includes_afrr_energy_fields(
         self, intraday_input: dict[str, Any]
     ) -> None:
-        """translate_intraday populates aFRR energy fields on TranslationResult."""
         inp = copy.deepcopy(intraday_input)
         n = len(inp["interval_start"])
 
@@ -101,7 +88,6 @@ class TestExtractAfrrEnergyMarket:
         inp["timeseries"].append(
             {"name": "afrr_energy_obligation_down", "values": [6.0] * n}
         )
-        inp["parameters"].append({"name": "afrr_energy_markup", "value": 2.0})
 
         result = translate_intraday(inp)
 
@@ -109,19 +95,23 @@ class TestExtractAfrrEnergyMarket:
         assert result.afrr_energy_obligation_down == [6.0] * n
         assert result.afrr_energy_open_mask == [True] * n
         assert result.afrr_energy_n_bands == 1
-        assert result.afrr_energy_markup == 2.0
+        assert not hasattr(result, "afrr_energy_markup")
 
 
 # ── _compute_afrr_energy_bids tests ──────────────────────────────────
 
 
 class TestComputeAfrrEnergyBids:
-    """Marginal cost computation for aFRR energy bid prices."""
+    """IC mid-price computation for aFRR energy bid prices."""
 
     def _make_dfs(
-        self, n: int, bid_price: float = 40.0, ask_price: float = 50.0
+        self,
+        n: int,
+        bid_price: float = 40.0,
+        ask_price: float = 50.0,
+        bid_volume: float = 5.0,
+        ask_volume: float = 5.0,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Create minimal solver output and input DataFrames."""
         df_output = pd.DataFrame({
             "soc": [10.0] * n,
             "charge_power": [0.0] * n,
@@ -130,186 +120,197 @@ class TestComputeAfrrEnergyBids:
         df_input = pd.DataFrame({
             "bid_prices[1]": [bid_price] * n,
             "ask_prices[1]": [ask_price] * n,
-            "grid_fee_in": [1.0] * n,
-            "grid_fee_out": [2.0] * n,
+            "bid_volumes[1]": [bid_volume] * n,
+            "ask_volumes[1]": [ask_volume] * n,
         })
         return df_output, df_input
 
-    def test_marginal_cost_formula_up(self) -> None:
-        """Up-direction price follows the formula exactly."""
+    def test_mid_price_up(self) -> None:
+        """Up-direction price equals (bid + ask) / 2."""
         n = 4
         df_out, df_in = self._make_dfs(n, bid_price=40.0, ask_price=50.0)
-        efficiency = 0.9
-        stored_energy_value = 30.0
-        cycling_penalty = 0.5
-        markup = 5.0
-
-        obligation_up = [10.0] * n
-        obligation_down = [0.0] * n
-        open_mask = [True] * n
         info: list[str] = []
 
         members = _compute_afrr_energy_bids(
-            df_out, df_in, 1,
-            obligation_up, obligation_down, open_mask,
-            1, markup, cycling_penalty, stored_energy_value, efficiency, None, info,
+            df_out, df_in, [],
+            [10.0] * n, [0.0] * n, [True] * n,
+            1, None, info,
         )
 
-        sqrt_eff = math.sqrt(efficiency)
-        ref_price = (40.0 + 50.0) / 2.0  # 45.0
-        expected_eff_loss_up = (1.0 / sqrt_eff - 1.0) * ref_price
-        expected_price_up = (
-            stored_energy_value + cycling_penalty + expected_eff_loss_up + 2.0 + markup
-        )
+        prices = members["afrr_energy_up_price[1]"]["values"]
+        assert prices == [pytest.approx(45.0)] * n
 
-        assert "afrr_energy_up_price[1]" in members
-        actual_prices = members["afrr_energy_up_price[1]"]["values"]
-        assert actual_prices[0] == pytest.approx(expected_price_up, rel=1e-6)
-
-    def test_marginal_cost_formula_down(self) -> None:
-        """Down-direction price follows the formula exactly."""
+    def test_mid_price_down_equals_up(self) -> None:
+        """Down-direction price equals the same IC mid (same source)."""
         n = 4
         df_out, df_in = self._make_dfs(n, bid_price=40.0, ask_price=50.0)
-        efficiency = 0.9
-        stored_energy_value = 30.0
-        cycling_penalty = 0.5
-        markup = 5.0
-
-        obligation_up = [0.0] * n
-        obligation_down = [8.0] * n
-        open_mask = [True] * n
         info: list[str] = []
 
         members = _compute_afrr_energy_bids(
-            df_out, df_in, 1,
-            obligation_up, obligation_down, open_mask,
-            1, markup, cycling_penalty, stored_energy_value, efficiency, None, info,
+            df_out, df_in, [],
+            [0.0] * n, [8.0] * n, [True] * n,
+            1, None, info,
         )
 
-        sqrt_eff = math.sqrt(efficiency)
-        ref_price = (40.0 + 50.0) / 2.0  # 45.0
-        expected_eff_loss_down = (1.0 - sqrt_eff) * ref_price
-        expected_price_down = (
-            -stored_energy_value + cycling_penalty - expected_eff_loss_down + 1.0 + markup
+        up = members["afrr_energy_up_price[1]"]["values"]
+        down = members["afrr_energy_down_price[1]"]["values"]
+        assert up == down
+
+    def test_negative_mid_price_propagates(self) -> None:
+        """Negative IC mid (cheap power) passes through unchanged."""
+        n = 2
+        df_out, df_in = self._make_dfs(n, bid_price=-20.0, ask_price=-10.0)
+        info: list[str] = []
+
+        members = _compute_afrr_energy_bids(
+            df_out, df_in, [],
+            [10.0] * n, [10.0] * n, [True] * n,
+            1, None, info,
         )
 
-        assert "afrr_energy_down_price[1]" in members
-        actual_prices = members["afrr_energy_down_price[1]"]["values"]
-        assert actual_prices[0] == pytest.approx(expected_price_down, rel=1e-6)
+        prices = members["afrr_energy_up_price[1]"]["values"]
+        assert prices == [pytest.approx(-15.0)] * n
+
+    def test_fallback_to_da_price(self) -> None:
+        """No IC depth → fall back to day-ahead price."""
+        n = 3
+        df_out, df_in = self._make_dfs(n, bid_volume=0.0, ask_volume=0.0)
+        info: list[str] = []
+        da_prices = [25.0, 30.0, 35.0]
+
+        members = _compute_afrr_energy_bids(
+            df_out, df_in, da_prices,
+            [10.0] * n, [10.0] * n, [True] * n,
+            1, None, info,
+        )
+
+        prices = members["afrr_energy_up_price[1]"]["values"]
+        assert prices == [25.0, 30.0, 35.0]
+        # Source label appears in info
+        assert any("da_price_fallback" in line for line in info)
+
+    def test_fallback_to_zero(self) -> None:
+        """No IC depth and no DA → zero."""
+        n = 2
+        df_out, df_in = self._make_dfs(n, bid_volume=0.0, ask_volume=0.0)
+        info: list[str] = []
+
+        members = _compute_afrr_energy_bids(
+            df_out, df_in, [],
+            [10.0] * n, [10.0] * n, [True] * n,
+            1, None, info,
+        )
+
+        prices = members["afrr_energy_up_price[1]"]["values"]
+        assert prices == [0.0, 0.0]
+        assert any("zero_fallback" in line for line in info)
 
     def test_volumes_equal_obligations(self) -> None:
-        """Output volumes match the obligation inputs exactly."""
+        """Output volumes equal the obligation inputs on open PTUs."""
         n = 3
         df_out, df_in = self._make_dfs(n)
-        obligation_up = [10.0, 0.0, 5.0]
-        obligation_down = [7.0, 3.0, 0.0]
-        open_mask = [True, True, True]
         info: list[str] = []
 
         members = _compute_afrr_energy_bids(
-            df_out, df_in, 1,
-            obligation_up, obligation_down, open_mask,
-            1, 0.0, 0.5, 30.0, 0.9, None, info,
+            df_out, df_in, [],
+            [10.0, 0.0, 5.0], [7.0, 3.0, 0.0], [True, True, True],
+            1, None, info,
         )
 
         assert members["afrr_energy_up_volume[1]"]["values"] == [10.0, 0.0, 5.0]
         assert members["afrr_energy_down_volume[1]"]["values"] == [7.0, 3.0, 0.0]
 
-    def test_closed_ptus_have_zero_prices(self) -> None:
-        """PTUs where open_mask is False have zero price and volume."""
+    def test_closed_ptus_have_zero(self) -> None:
+        """PTUs where open_mask is False emit zero price and zero volume."""
         n = 4
         df_out, df_in = self._make_dfs(n)
-        obligation_up = [10.0, 10.0, 10.0, 10.0]
-        obligation_down = [5.0, 5.0, 5.0, 5.0]
-        open_mask = [False, True, False, True]
         info: list[str] = []
 
         members = _compute_afrr_energy_bids(
-            df_out, df_in, 1,
-            obligation_up, obligation_down, open_mask,
-            1, 0.0, 0.5, 30.0, 0.9, None, info,
+            df_out, df_in, [],
+            [10.0] * n, [5.0] * n, [False, True, False, True],
+            1, None, info,
         )
 
         prices_up = members["afrr_energy_up_price[1]"]["values"]
-        assert prices_up[0] == 0.0
-        assert prices_up[2] == 0.0
-        assert prices_up[1] != 0.0
-        assert prices_up[3] != 0.0
+        volumes_up = members["afrr_energy_up_volume[1]"]["values"]
+        assert prices_up[0] == 0.0 and prices_up[2] == 0.0
+        assert prices_up[1] != 0.0 and prices_up[3] != 0.0
+        assert volumes_up[0] == 0.0 and volumes_up[2] == 0.0
+        assert volumes_up[1] == 10.0 and volumes_up[3] == 10.0
 
-    def test_multi_band_fills_zeros_beyond_band_1(self) -> None:
-        """Bands 2+ have zero price and zero volume."""
+    def test_all_bands_carry_full_value(self) -> None:
+        """Bands 2..N carry the same price and same volume as band 1."""
         n = 2
-        df_out, df_in = self._make_dfs(n)
+        df_out, df_in = self._make_dfs(n, bid_price=40.0, ask_price=50.0)
         info: list[str] = []
 
         members = _compute_afrr_energy_bids(
-            df_out, df_in, 1,
+            df_out, df_in, [],
             [10.0] * n, [5.0] * n, [True] * n,
-            3, 0.0, 0.5, 30.0, 0.9, None, info,
+            3, None, info,
         )
 
-        assert "afrr_energy_up_price[2]" in members
-        assert "afrr_energy_up_price[3]" in members
-        assert members["afrr_energy_up_price[2]"]["values"] == [0.0, 0.0]
-        assert members["afrr_energy_up_volume[2]"]["values"] == [0.0, 0.0]
-        assert members["afrr_energy_down_price[3]"]["values"] == [0.0, 0.0]
-        assert members["afrr_energy_down_volume[3]"]["values"] == [0.0, 0.0]
+        for k in (1, 2, 3):
+            assert members[f"afrr_energy_up_price[{k}]"]["values"] == [
+                pytest.approx(45.0)
+            ] * n
+            assert members[f"afrr_energy_up_volume[{k}]"]["values"] == [10.0] * n
+            assert members[f"afrr_energy_down_price[{k}]"]["values"] == [
+                pytest.approx(45.0)
+            ] * n
+            assert members[f"afrr_energy_down_volume[{k}]"]["values"] == [5.0] * n
 
-    def test_info_contains_decomposition(self) -> None:
-        """_info entries contain the full price decomposition for traceability."""
+    def test_info_transparency_note(self) -> None:
+        """Info entries name the price source and the pay-as-cleared rationale."""
         n = 2
         df_out, df_in = self._make_dfs(n)
         info: list[str] = []
 
         _compute_afrr_energy_bids(
-            df_out, df_in, 1,
+            df_out, df_in, [],
             [10.0] * n, [5.0] * n, [True, False],
-            1, 5.0, 0.5, 30.0, 0.9, None, info,
+            1, None, info,
         )
 
-        # Only PTU 0 is open → should have exactly 2 info entries (up + down)
         bid_info = [i for i in info if i.startswith("afrr_energy_bid_")]
         assert len(bid_info) == 2
-        assert "opportunity_cost(30.00)" in bid_info[0]
-        assert "cycling(0.50)" in bid_info[0]
-        assert "markup(5.00)" in bid_info[0]
+        for line in bid_info:
+            assert "ic_orderbook_mid_price" in line
+            assert "pay-as-cleared activation" in line
 
     def test_no_open_ptus_returns_empty(self) -> None:
-        """When no PTUs are open, returns empty dict."""
         n = 3
         df_out, df_in = self._make_dfs(n)
         info: list[str] = []
 
         members = _compute_afrr_energy_bids(
-            df_out, df_in, 1,
+            df_out, df_in, [],
             [0.0] * n, [0.0] * n, [False] * n,
-            1, 0.0, 0.5, 30.0, 0.9, None, info,
+            1, None, info,
         )
 
         assert members == {}
 
     def test_grid_shaping(self) -> None:
-        """When a grid is provided, output values are collapsed onto it."""
+        """Output values are collapsed onto the provided grid blocks."""
         n = 4
         df_out, df_in = self._make_dfs(n)
-        # Grid covers PTUs 1 and 2 (2 blocks)
         grid = {
             "interval_start": ["2025-08-01T01:00:00Z", "2025-08-01T02:00:00Z"],
             "interval_end": ["2025-08-01T02:00:00Z", "2025-08-01T03:00:00Z"],
             "blocks": [[1], [2]],
         }
-        open_mask = [False, True, True, False]
         info: list[str] = []
 
         members = _compute_afrr_energy_bids(
-            df_out, df_in, 1,
+            df_out, df_in, [],
             [0.0, 10.0, 10.0, 0.0],
             [0.0, 5.0, 5.0, 0.0],
-            open_mask,
-            1, 0.0, 0.5, 30.0, 0.9, grid, info,
+            [False, True, True, False],
+            1, grid, info,
         )
 
-        # Grid has 2 blocks → output should have 2 values
         assert len(members["afrr_energy_up_price[1]"]["values"]) == 2
         assert len(members["afrr_energy_up_volume[1]"]["values"]) == 2
         assert "interval_start" in members["afrr_energy_up_price[1]"]

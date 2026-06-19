@@ -55,7 +55,6 @@ class TranslationResult:
     afrr_energy_obligation_down: list[float] = field(default_factory=list)
     afrr_energy_open_mask: list[bool] = field(default_factory=list)
     afrr_energy_n_bands: int = 0
-    afrr_energy_markup: float = 0.0
     afrr_energy_grid: dict | None = None
     # Multi-band DA config — consumed by solver_runner to inject probabilities
     # into the dynamic solver class and select the correct model directory.
@@ -561,21 +560,20 @@ def _extract_afrr_energy_market(
     model_input: dict[str, Any],
     ptu_starts_dt: list[datetime],
     info: list[str],
-) -> tuple[list[float], list[float], list[bool], int, float, dict | None]:
+) -> tuple[list[float], list[float], list[bool], int, dict | None]:
     """Extract aFRR energy bid inputs from the PE request.
 
-    Returns ``(obligation_up, obligation_down, open_mask, n_bands, markup, grid)``:
+    Returns ``(obligation_up, obligation_down, open_mask, n_bands, grid)``:
 
     - ``obligation_up`` / ``obligation_down`` — per-PTU obligation in MW (0.0
       for PTUs not open for energy bidding).
     - ``open_mask`` — True for PTUs where an energy bid must be submitted.
     - ``n_bands`` — number of price bands requested by the caller.
-    - ``markup`` — configurable EUR/MWh risk premium added to the marginal cost.
     - ``grid`` — the market's own ``interval_start`` / ``interval_end`` for
       output shaping (None if no market present).
     """
     n_intervals = len(ptu_starts_dt)
-    default = ([0.0] * n_intervals, [0.0] * n_intervals, [False] * n_intervals, 0, 0.0, None)
+    default = ([0.0] * n_intervals, [0.0] * n_intervals, [False] * n_intervals, 0, None)
 
     market = None
     for m in model_input.get("markets", []):
@@ -586,7 +584,6 @@ def _extract_afrr_energy_market(
         return default
 
     n_bands = int(market.get("n_price_bands", 1) or 1)
-    markup = float(_find_parameter(model_input, "afrr_energy_markup", default=0.0) or 0.0)
 
     # Obligation timeseries use a partial grid (only open PTUs). Unlike
     # other timeseries that must cover every PTU, obligations are zero for
@@ -616,10 +613,10 @@ def _extract_afrr_energy_market(
     n_open = sum(open_mask)
     info.append(
         f"applied: afrr_energy market — {n_open} open PTU(s), "
-        f"n_price_bands={n_bands}, markup={markup:.2f} EUR/MWh"
+        f"n_price_bands={n_bands}, pricing=ic_orderbook_mid"
     )
 
-    return obligation_up, obligation_down, open_mask, n_bands, markup, grid
+    return obligation_up, obligation_down, open_mask, n_bands, grid
 
 
 # ── scheduling ───────────────────────────────────────────────────────
@@ -1089,7 +1086,6 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
         afrr_energy_obligation_down,
         afrr_energy_open_mask,
         afrr_energy_n_bands,
-        afrr_energy_markup,
         afrr_energy_grid,
     ) = _extract_afrr_energy_market(model_input, ptu_starts_dt, info)
 
@@ -1290,6 +1286,5 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
         afrr_energy_obligation_down=afrr_energy_obligation_down,
         afrr_energy_open_mask=afrr_energy_open_mask,
         afrr_energy_n_bands=afrr_energy_n_bands,
-        afrr_energy_markup=afrr_energy_markup,
         afrr_energy_grid=afrr_energy_grid,
     )
