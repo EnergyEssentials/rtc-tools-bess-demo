@@ -35,6 +35,9 @@ model BESS
   // Binary variables for complementarity on physical dispatch
   Boolean is_charging "True if battery is charging";
   Boolean is_discharging "True if battery is discharging";
+  // Direction selector for aFRR capacity bids — within each block this is pinned constant by the Python cross-time constraints; 
+  // bid_afrr_up_total is gated through big-M on this var and bid_afrr_down_total on its complement.
+  Boolean afrr_up_active "True when this PTU's block bids aFRR up; false → aFRR down (or neither)";
 
   // Energy-market inputs
   input Real price(fixed = true) "Electricity price in EUR/MWh";

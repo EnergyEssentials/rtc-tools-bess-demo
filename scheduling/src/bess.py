@@ -279,6 +279,29 @@ class BESS(
             )
         )
 
+        # Per-block aFRR single-direction enforcement: big-M gating on the ``afrr_up_active`` selector. 
+        # Active only when both markets are open; otherwise the closed-market pin below already zeroes the absent side.
+        afrr_up_open = bool((self.reserve_config.get("afrr_up") or {}).get("open"))
+        afrr_down_open = bool((self.reserve_config.get("afrr_down") or {}).get("open"))
+        if afrr_up_open and afrr_down_open:
+            afrr_up_active = self.state("afrr_up_active")
+            constraints.append(
+                (
+                    self.state("bid_afrr_up_total") - max_power * afrr_up_active,
+                    -np.inf,
+                    0.0,
+                )
+            )
+            constraints.append(
+                (
+                    self.state("bid_afrr_down_total")
+                    + max_power * afrr_up_active
+                    - max_power,
+                    -np.inf,
+                    0.0,
+                )
+            )
+
         # SoC LER (limited-energy reservoir) constraints.  The battery must
         # keep enough headroom to honour the worst-case activation for the
         # product's T_min duration.  Down-side reserves squeeze the *top* of
@@ -377,6 +400,29 @@ class BESS(
         if len(times) < 2:
             return out
 
+        # pe_to_rtc prepends one dummy timestep to ``times`` (real PTU i
+        # lives at times[i+1]); block indices come from _blocks_from_grid using
+        # real-PTU 0-based positions, so every state_at lookup needs +1.
+        def _t(idx: int) -> float:
+            return times[idx + 1]
+
+        def _in_range(idx: int) -> bool:
+            return 0 <= idx + 1 < len(times)
+
+        # per-block single-direction aFRR bids; assumes afrr_up and afrr_down share the same block grid. 
+        # Fail loud otherwise.
+        afrr_up_cfg = self.reserve_config.get("afrr_up") or {}
+        afrr_down_cfg = self.reserve_config.get("afrr_down") or {}
+        if afrr_up_cfg.get("open") and afrr_down_cfg.get("open"):
+            up_blocks = [tuple(b) for b in afrr_up_cfg.get("blocks", [])]
+            down_blocks = [tuple(b) for b in afrr_down_cfg.get("blocks", [])]
+            if up_blocks != down_blocks:
+                raise ValueError(
+                    "aFRR up and aFRR down must share the same block grid for "
+                    "single-direction-per-block enforcement; got "
+                    f"up={up_blocks!r} down={down_blocks!r}"
+                )
+
         for product in ("fcr", "afrr_up", "afrr_down"):
             pcfg = self.reserve_config.get(product) or {}
             if not pcfg.get("open"):
@@ -394,13 +440,13 @@ class BESS(
                         if not block or len(block) < 2:
                             continue
                         ref_idx = block[0]
-                        if ref_idx >= len(times):
+                        if not _in_range(ref_idx):
                             continue
-                        ref_val = self.state_at(var, times[ref_idx], ensemble_member)
+                        ref_val = self.state_at(var, _t(ref_idx), ensemble_member)
                         for idx in block[1:]:
-                            if idx >= len(times):
+                            if not _in_range(idx):
                                 continue
-                            other = self.state_at(var, times[idx], ensemble_member)
+                            other = self.state_at(var, _t(idx), ensemble_member)
                             out.append((other - ref_val, 0.0, 0.0))
             else:
                 # Single-band: constrain the aggregate bid_total as before
@@ -409,14 +455,36 @@ class BESS(
                     if not block or len(block) < 2:
                         continue
                     ref_idx = block[0]
-                    if ref_idx >= len(times):
+                    if not _in_range(ref_idx):
                         continue
-                    ref_val = self.state_at(var, times[ref_idx], ensemble_member)
+                    ref_val = self.state_at(var, _t(ref_idx), ensemble_member)
                     for idx in block[1:]:
-                        if idx >= len(times):
+                        if not _in_range(idx):
                             continue
-                        other = self.state_at(var, times[idx], ensemble_member)
+                        other = self.state_at(var, _t(idx), ensemble_member)
                         out.append((other - ref_val, 0.0, 0.0))
+
+        # Per-block aFRR single-direction enforcement: ``afrr_up_active`` is
+        # pinned constant within each block, and the path-level big-M
+        # constraints (path_constraints) gate bid_afrr_up_total /
+        # bid_afrr_down_total on its value.
+        if afrr_up_cfg.get("open") and afrr_down_cfg.get("open"):
+            for block in afrr_up_cfg.get("blocks", []):
+                if not block or len(block) < 2:
+                    continue
+                ref_idx = block[0]
+                if not _in_range(ref_idx):
+                    continue
+                ref_val = self.state_at(
+                    "afrr_up_active", _t(ref_idx), ensemble_member
+                )
+                for idx in block[1:]:
+                    if not _in_range(idx):
+                        continue
+                    other = self.state_at(
+                        "afrr_up_active", _t(idx), ensemble_member
+                    )
+                    out.append((other - ref_val, 0.0, 0.0))
 
         return out
 
