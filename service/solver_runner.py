@@ -77,6 +77,13 @@ _INTRADAY_MO = _INTRADAY_MODEL / "BESSIntraday.mo"
 _intraday_model_cache: dict[int, Path] = {}
 _intraday_model_lock = threading.Lock()
 
+# Scheduling model directory cache keyed by band dimensions tuple
+# (n_da_bands, n_fcr_bands, n_afrr_up_bands, n_afrr_down_bands).
+# When all are 1 the original repo directory is used.  For any > 1,
+# a patched copy of BESS.mo is written to a stable temp directory.
+_scheduling_model_cache: dict[tuple[int, int, int, int], Path] = {}
+_scheduling_model_lock = threading.Lock()
+
 
 def run_solver(
     solver_type: str,
@@ -128,24 +135,37 @@ def _run_scheduling(
                 "_cycling_penalty": translation.cycling_penalty,
                 "_stored_energy_value": translation.stored_energy_value,
                 "_reserve_config": translation.reserve_config,
+                "_n_da_bands": translation.n_da_bands,
+                "_da_band_prices": translation.da_band_prices,
+                "_da_clearing_probs": translation.da_clearing_probs,
+                "_reserve_acceptance_probs": translation.reserve_acceptance_probs,
+                "_reserve_offer_prices": translation.offer_prices_per_product,
                 "model_name": "BESS",
             },
         )
 
         _log.info(
             "Running scheduling solver (cycling_penalty=%.4f, "
-            "stored_energy_value=%.4f)",
+            "stored_energy_value=%.4f, n_da_bands=%d)",
             translation.cycling_penalty,
             translation.stored_energy_value,
+            translation.n_da_bands,
         )
         # model_folder points at the stable repo directory so pymoca's
         # .pymoca_cache is preserved across requests.  input/output remain
         # in the per-run temp directory.
         # The returned problem instance exposes solver internals (objective
         # value, solver stats, Lagrange multipliers) used for diagnostics.
+        band_dims = (
+            translation.n_da_bands,
+            translation.n_bands_per_product.get("fcr", 1),
+            translation.n_bands_per_product.get("afrr_up", 1),
+            translation.n_bands_per_product.get("afrr_down", 1),
+        )
+        model_dir = _get_scheduling_model_dir(band_dims)
         prob = run_optimization_problem(
             klass,
-            model_folder=str(_SCHEDULING_MODEL),
+            model_folder=str(model_dir),
             input_folder=str(base / "input"),
             output_folder=str(base / "output"),
             log_level=logging.WARNING,
@@ -273,11 +293,7 @@ def _run_intraday(
             afrr_energy_obligation_down=translation.afrr_energy_obligation_down,
             afrr_energy_open_mask=translation.afrr_energy_open_mask,
             afrr_energy_n_bands=translation.afrr_energy_n_bands,
-            afrr_energy_markup=translation.afrr_energy_markup,
             afrr_energy_grid=translation.afrr_energy_grid,
-            cycling_penalty_factor=translation.cycling_penalty,
-            stored_energy_value=translation.stored_energy_value,
-            efficiency=_get_efficiency(translation),
         )
         response: dict[str, Any] = {"result": result}
         if reasoning_markdown:
@@ -286,22 +302,6 @@ def _run_intraday(
 
 
 # ── helpers ──────────────────────────────────────────────────────────
-
-
-def _get_efficiency(translation: TranslationResult) -> float:
-    """Extract round-trip efficiency from the translation's parameters CSV.
-
-    Falls back to the Modelica default (0.9) when no override was provided.
-    """
-    if translation.parameters_csv:
-        import csv
-        import io
-
-        reader = csv.DictReader(io.StringIO(translation.parameters_csv))
-        for row in reader:
-            if "efficiency" in row:
-                return float(row["efficiency"])
-    return 0.9
 
 
 def _prepare_io_dirs(base: Path) -> None:
@@ -321,6 +321,55 @@ def _write_inputs(base: Path, translation: TranslationResult) -> None:
         (base / "input" / "parameters.csv").write_text(
             translation.parameters_csv, encoding="utf-8"
         )
+
+
+def _get_scheduling_model_dir(band_dims: tuple[int, int, int, int]) -> Path:
+    """Return a stable model directory for the given band dimensions.
+
+    Args:
+        band_dims: (n_da_bands, n_fcr_bands, n_afrr_up_bands, n_afrr_down_bands)
+
+    When all dimensions are 1, the original repo directory is used unchanged.
+    For any dimension > 1, a patched copy is written to a stable temp directory.
+    """
+    if band_dims == (1, 1, 1, 1):
+        return _SCHEDULING_MODEL
+
+    if band_dims in _scheduling_model_cache:
+        return _scheduling_model_cache[band_dims]
+
+    with _scheduling_model_lock:
+        if band_dims in _scheduling_model_cache:
+            return _scheduling_model_cache[band_dims]
+
+        model_dir = Path(tempfile.mkdtemp(
+            prefix=f"bess_sched_model_{'_'.join(str(d) for d in band_dims)}_"
+        ))
+        _write_scheduling_model(model_dir, band_dims)
+        _scheduling_model_cache[band_dims] = model_dir
+        _log.info(
+            "Scheduling model directory created for band_dims=%s at %s",
+            band_dims,
+            model_dir,
+        )
+        return model_dir
+
+
+def _write_scheduling_model(
+    model_dir: Path, band_dims: tuple[int, int, int, int]
+) -> None:
+    """Write ``BESS.mo`` with all band dimension parameters patched."""
+    mo_content = (_SCHEDULING_MODEL / "BESS.mo").read_text(encoding="utf-8")
+
+    param_names = ("n_da_bands", "n_fcr_bands", "n_afrr_up_bands", "n_afrr_down_bands")
+    for param, value in zip(param_names, band_dims):
+        mo_content = re.sub(
+            rf"parameter\s+Integer\s+{param}\s*=\s*\d+",
+            f"parameter Integer {param} = {value}",
+            mo_content,
+        )
+
+    (model_dir / "BESS.mo").write_text(mo_content, encoding="utf-8")
 
 
 def _get_intraday_model_dir(n_segments: int) -> Path:

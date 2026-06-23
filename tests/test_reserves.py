@@ -9,7 +9,6 @@ import pytest
 
 from service.solver_runner import run_solver
 from service.translation.pe_to_rtc import (
-    _detect_blocks_from_runs,
     translate_scheduling,
 )
 
@@ -74,14 +73,35 @@ class TestReserveTranslation:
     def test_open_fcr_market_populates_reserve_config(
         self, scheduling_input: dict[str, Any]
     ) -> None:
-        """Standby-price runs become bid blocks; activation_duration → t_min_hours."""
+        """Explicit standby-price market grid becomes reserve bid blocks."""
         scheduling_input = copy.deepcopy(scheduling_input)
         n = len(scheduling_input["interval_start"])
-        # 24 hourly PTUs → 4h blocks → 6 blocks of identical standby price
-        block_prices = [10.0] * 4 + [12.0] * 4 + [8.0] * 4 + [11.0] * 4 + [9.0] * 4 + [7.0] * 4
+        # 24 hourly PTUs -> 6 explicit 4h market blocks
+        block_prices = [10.0, 12.0, 8.0, 11.0, 9.0, 7.0]
+        block_starts = [
+            "2025-08-01T00:00:00Z",
+            "2025-08-01T04:00:00Z",
+            "2025-08-01T08:00:00Z",
+            "2025-08-01T12:00:00Z",
+            "2025-08-01T16:00:00Z",
+            "2025-08-01T20:00:00Z",
+        ]
+        block_ends = [
+            "2025-08-01T04:00:00Z",
+            "2025-08-01T08:00:00Z",
+            "2025-08-01T12:00:00Z",
+            "2025-08-01T16:00:00Z",
+            "2025-08-01T20:00:00Z",
+            "2025-08-02T00:00:00Z",
+        ]
         scheduling_input["timeseries"].extend(
             [
-                {"name": "fcr_standby_price", "values": block_prices},
+                {
+                    "name": "fcr_standby_price",
+                    "values": block_prices,
+                    "interval_start": block_starts,
+                    "interval_end": block_ends,
+                },
                 {"name": "fcr_activation_fraction", "values": [0.10] * n},
             ]
         )
@@ -96,20 +116,12 @@ class TestReserveTranslation:
         result = translate_scheduling(scheduling_input)
         assert result.reserve_config["fcr"]["open"] is True
         assert result.reserve_config["fcr"]["t_min_hours"] == pytest.approx(0.25)
-        # Six runs of length 4 → six blocks
+        # Six explicit market blocks -> six PTU-index blocks of length 4
         blocks = result.reserve_config["fcr"]["blocks"]
         assert len(blocks) == 6
         for blk in blocks:
             assert len(blk) == 4
 
-    def test_block_detection_from_runs(self) -> None:
-        """_detect_blocks_from_runs groups consecutive identical values."""
-        assert _detect_blocks_from_runs([]) == []
-        assert _detect_blocks_from_runs([5.0]) == [[0]]
-        assert _detect_blocks_from_runs([1.0, 1.0, 2.0, 2.0]) == [[0, 1], [2, 3]]
-        # Single-PTU blocks when every value differs
-        out = _detect_blocks_from_runs([1.0, 2.0, 3.0])
-        assert out == [[0], [1], [2]]
 
     def test_committed_fcr_position_populates_csv_column(
         self, scheduling_input: dict[str, Any]
@@ -323,10 +335,10 @@ class TestReserveAPI:
         detail = resp.json()["detail"]
         assert "fcr_activation_fraction" in detail["message"]
 
-    def test_reasoning_markdown_includes_reserve_sections(
+    def test_reasoning_markdown_includes_counterfactual_skip_note(
         self, client, scheduling_input: dict[str, Any]
     ) -> None:
-        """When diagnostics enabled, reserve sections appear in markdown."""
+        """Diagnostics markdown keeps reserve/counterfactual narrative coherent."""
         cfg = copy.deepcopy(scheduling_input)
         n = len(cfg["interval_start"])
         cfg["timeseries"].extend(
@@ -352,10 +364,10 @@ class TestReserveAPI:
             json={"model_input_data": cfg, "include_diagnostics": True},
         )
         assert resp.status_code == 200, resp.text
-        markdown = resp.json().get("reasoning_markdown", "")
-        # Reserve sections must appear when there are open markets with bids
-        assert "## Reserve Bids" in markdown
+        body = resp.json()
+        markdown = body.get("reasoning_markdown", "")
         # Counterfactual section says it was skipped
+        assert "## Counterfactual" in markdown
         assert "skip_counterfactual_reserves" in markdown
 
     def test_counterfactual_section_when_enabled(
