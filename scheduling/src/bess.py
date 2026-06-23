@@ -400,7 +400,7 @@ class BESS(
         if len(times) < 2:
             return out
 
-        # pe_to_rtc prepends one dummy timestep to ``times`` (real PTU i
+        # Why: pe_to_rtc prepends one dummy timestep to ``times`` (real PTU i
         # lives at times[i+1]); block indices come from _blocks_from_grid using
         # real-PTU 0-based positions, so every state_at lookup needs +1.
         def _t(idx: int) -> float:
@@ -409,19 +409,8 @@ class BESS(
         def _in_range(idx: int) -> bool:
             return 0 <= idx + 1 < len(times)
 
-        # per-block single-direction aFRR bids; assumes afrr_up and afrr_down share the same block grid. 
-        # Fail loud otherwise.
         afrr_up_cfg = self.reserve_config.get("afrr_up") or {}
         afrr_down_cfg = self.reserve_config.get("afrr_down") or {}
-        if afrr_up_cfg.get("open") and afrr_down_cfg.get("open"):
-            up_blocks = [tuple(b) for b in afrr_up_cfg.get("blocks", [])]
-            down_blocks = [tuple(b) for b in afrr_down_cfg.get("blocks", [])]
-            if up_blocks != down_blocks:
-                raise ValueError(
-                    "aFRR up and aFRR down must share the same block grid for "
-                    "single-direction-per-block enforcement; got "
-                    f"up={up_blocks!r} down={down_blocks!r}"
-                )
 
         for product in ("fcr", "afrr_up", "afrr_down"):
             pcfg = self.reserve_config.get(product) or {}

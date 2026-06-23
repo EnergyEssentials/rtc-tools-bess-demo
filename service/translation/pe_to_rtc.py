@@ -544,6 +544,19 @@ def _extract_reserves(
             f"{len(blocks)} block(s), n_price_bands={n_bands}"
         )
 
+    # per-block single-direction enforcement in bess.py requires aFRR up
+    # and down to share the same block grid; fail here (422) rather than inside
+    # the solver (opaque 500).
+    if reserve_config.get("afrr_up", {}).get("open") and reserve_config.get("afrr_down", {}).get("open"):
+        up_blocks = reserve_config["afrr_up"]["blocks"]
+        down_blocks = reserve_config["afrr_down"]["blocks"]
+        if up_blocks != down_blocks:
+            raise ValueError(
+                "aFRR up and aFRR down must share the same block grid when both markets are open "
+                "(required for single-direction-per-block enforcement); got "
+                f"afrr_up blocks={up_blocks!r} vs afrr_down blocks={down_blocks!r}"
+            )
+
     return (
         reserve_config,
         reserve_columns,
