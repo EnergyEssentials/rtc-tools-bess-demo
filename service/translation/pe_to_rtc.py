@@ -588,9 +588,10 @@ def _extract_afrr_energy_market(
     n_intervals = len(ptu_starts_dt)
     default = ([0.0] * n_intervals, [0.0] * n_intervals, [False] * n_intervals, 0, None)
 
+    _AFRR_ENERGY_MARKET_NAMES = {"afrr_energy", "afrr_energy_up", "afrr_energy_down"}
     market = None
     for m in model_input.get("markets", []):
-        if m.get("name") == "afrr_energy":
+        if m.get("name") in _AFRR_ENERGY_MARKET_NAMES or m.get("type") == "afrr_energy":
             market = m
             break
     if market is None:
@@ -598,17 +599,16 @@ def _extract_afrr_energy_market(
 
     n_bands = int(market.get("n_price_bands", 1) or 1)
 
-    # Obligation timeseries use a partial grid (only open PTUs). Unlike
-    # other timeseries that must cover every PTU, obligations are zero for
-    # PTUs not in the grid.  We map values to covered PTUs manually.
-    up_ts = _find_timeseries(model_input, "afrr_energy_obligation_up")
+    # Committed capacity positions serve as the energy bid obligation: the
+    # battery must cover whatever aFRR capacity was cleared in the prior auction.
+    up_ts = _find_timeseries(model_input, "afrr_up_position")
     obligation_up, up_grid = _expand_partial_timeseries(
-        up_ts, ptu_starts_dt, n_intervals, "afrr_energy_obligation_up"
+        up_ts, ptu_starts_dt, n_intervals, "afrr_up_position"
     )
 
-    down_ts = _find_timeseries(model_input, "afrr_energy_obligation_down")
+    down_ts = _find_timeseries(model_input, "afrr_down_position")
     obligation_down, down_grid = _expand_partial_timeseries(
-        down_ts, ptu_starts_dt, n_intervals, "afrr_energy_obligation_down"
+        down_ts, ptu_starts_dt, n_intervals, "afrr_down_position"
     )
 
     # The market grid comes from whichever obligation timeseries declared one;

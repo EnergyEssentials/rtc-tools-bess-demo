@@ -46,13 +46,13 @@ class TestExtractAfrrEnergyMarket:
             ],
             "timeseries": [
                 {
-                    "name": "afrr_energy_obligation_up",
+                    "name": "afrr_up_position",
                     "values": [10.0, 10.0],
                     "interval_start": ["2025-08-01T01:00:00Z", "2025-08-01T02:00:00Z"],
                     "interval_end": ["2025-08-01T02:00:00Z", "2025-08-01T03:00:00Z"],
                 },
                 {
-                    "name": "afrr_energy_obligation_down",
+                    "name": "afrr_down_position",
                     "values": [5.0, 5.0],
                     "interval_start": ["2025-08-01T01:00:00Z", "2025-08-01T02:00:00Z"],
                     "interval_end": ["2025-08-01T02:00:00Z", "2025-08-01T03:00:00Z"],
@@ -73,6 +73,33 @@ class TestExtractAfrrEnergyMarket:
         assert grid is not None
         assert len(grid["interval_start"]) == 2
 
+    def test_split_market_names_afrr_energy_up_down_recognised(self) -> None:
+        """Markets named afrr_energy_up / afrr_energy_down with type afrr_energy
+        are recognised and afrr_up/down_position drives the obligation."""
+        ptu_starts = [_parse_iso_utc(f"2025-08-01T{h:02d}:00:00Z") for h in range(4)]
+        model_input: dict[str, Any] = {
+            "markets": [
+                {"name": "afrr_energy_up",   "type": "afrr_energy", "interval_length_minutes": 60},
+                {"name": "afrr_energy_down", "type": "afrr_energy", "interval_length_minutes": 60},
+            ],
+            "timeseries": [
+                {"name": "afrr_up_position",   "values": [0.0, 7.0, 7.0, 0.0]},
+                {"name": "afrr_down_position", "values": [0.0, 3.0, 3.0, 0.0]},
+            ],
+            "parameters": [],
+        }
+        info: list[str] = []
+
+        up, down, mask, n_bands, grid = _extract_afrr_energy_market(
+            model_input, ptu_starts, info
+        )
+
+        assert up == [0.0, 7.0, 7.0, 0.0]
+        assert down == [0.0, 3.0, 3.0, 0.0]
+        assert mask == [False, True, True, False]
+        assert n_bands == 1
+        assert any("afrr_energy" in e for e in info)
+
     def test_translate_intraday_includes_afrr_energy_fields(
         self, intraday_input: dict[str, Any]
     ) -> None:
@@ -83,10 +110,10 @@ class TestExtractAfrrEnergyMarket:
             {"name": "afrr_energy", "type": "afrr_energy_bid", "n_price_bands": 1}
         )
         inp["timeseries"].append(
-            {"name": "afrr_energy_obligation_up", "values": [8.0] * n}
+            {"name": "afrr_up_position", "values": [8.0] * n}
         )
         inp["timeseries"].append(
-            {"name": "afrr_energy_obligation_down", "values": [6.0] * n}
+            {"name": "afrr_down_position", "values": [6.0] * n}
         )
 
         result = translate_intraday(inp)
