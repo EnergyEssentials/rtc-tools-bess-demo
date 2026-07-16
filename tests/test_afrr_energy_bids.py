@@ -232,6 +232,47 @@ class TestComputeAfrrEnergyBids:
         assert prices == [0.0, 0.0]
         assert any("zero_fallback" in line for line in info)
 
+    def test_volumes_down_equal_obligations(self) -> None:
+        """Output volumes equal the obligation inputs on open PTUs."""
+        n = 3
+        df_out, df_in = self._make_dfs(n)
+        info: list[str] = []
+
+        members = _compute_afrr_energy_bids(
+            df=df_out, 
+            df_input=df_in, 
+            da_prices=[],
+            obligation_up=[], 
+            obligation_down=[7.0, 3.0, 0.0], 
+            open_mask=[True, True, True],
+            n_bands=1, 
+            grid=None, 
+            info=info,
+        )
+
+        assert members["afrr_energy_down_volume[1]"]["values"] == [7.0, 3.0, 0.0]
+
+    def test_volumes_up_equal_obligations(self) -> None:
+        """Output volumes equal the obligation inputs on open PTUs."""
+        n = 3
+        df_out, df_in = self._make_dfs(n)
+        info: list[str] = []
+
+        members = _compute_afrr_energy_bids(
+            df=df_out, 
+            df_input=df_in, 
+            da_prices=[],
+            obligation_up=[10.0, 0.0, 5.0], 
+            obligation_down=[], 
+            open_mask=[True, True, True],
+            n_bands=1, 
+            grid=None, 
+            info=info,
+        )
+
+        assert members["afrr_energy_up_volume[1]"]["values"] == [10.0, 0.0, 5.0]
+
+
     def test_volumes_equal_obligations(self) -> None:
         """Output volumes equal the obligation inputs on open PTUs."""
         n = 3
@@ -246,6 +287,8 @@ class TestComputeAfrrEnergyBids:
 
         assert members["afrr_energy_up_volume[1]"]["values"] == [10.0, 0.0, 5.0]
         assert members["afrr_energy_down_volume[1]"]["values"] == [7.0, 3.0, 0.0]
+
+
 
     def test_closed_ptus_have_zero(self) -> None:
         """PTUs where open_mask is False emit zero price and zero volume."""
