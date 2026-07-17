@@ -777,6 +777,14 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
                 f"ignored_input: market config '{mname}' (type={mtype}) "
                 f"— only 'day_ahead' bid_offer_stack is supported"
             )
+        else:
+            info.append(
+                f"ignored_input: market config '{mname}' (type={mtype}) — "
+                f"unrecognized market name/type combination; expected name in "
+                f"{_RESERVE_PRODUCTS} or type in ('imbalance', 'bid_offer_stack'). "
+                f"If this was meant to be a reserve market, check for a name "
+                f"mismatch upstream — it will be treated as closed."
+            )
 
     # ── reserves ──
     (
@@ -1055,18 +1063,32 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
         )
 
     # ignored market configs
+    _INTRADAY_HANDLED_ELSEWHERE = {
+        "orderbook",
+        "afrr_energy",
+        "afrr_energy_up",
+        "afrr_energy_down",
+    }
     for market in model_input.get("markets", []):
         mtype = market.get("type", "unknown")
         mname = market.get("name", "unknown")
-        if mname in _RESERVE_PRODUCTS:
+        if mname in _RESERVE_PRODUCTS or mname in _INTRADAY_HANDLED_ELSEWHERE:
             # Reserve markets handled by _extract_reserves below.  The intraday
             # solver never bids reserves but still consumes their LER and
-            # headroom impact via the committed_<p> timeseries.
+            # headroom impact via the committed_<p> timeseries.  orderbook /
+            # afrr_energy markets are handled by their own dedicated extractors.
             continue
         if mtype == "imbalance":
             info.append(
                 f"ignored_input: market config '{mname}' (type={mtype}) "
                 f"— imbalance market not modeled"
+            )
+        elif mtype != "afrr_energy":
+            info.append(
+                f"ignored_input: market config '{mname}' (type={mtype}) — "
+                f"unrecognized market name/type combination for the intraday "
+                f"solver. If this was meant to be a reserve or energy market, "
+                f"check for a name mismatch upstream — it will be ignored."
             )
 
     # ── reserves ──
